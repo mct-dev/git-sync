@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+#
+# git-sync - Update main branches of all git repos in current directory (in parallel)
+#
+
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Configuration
+MAX_PARALLEL=${GIT_SYNC_PARALLEL:-10}
+TARGET_DIR="${1:-.}"
+
+usage() {
+    echo "Usage: git-sync [directory]"
+    echo ""
+    echo "Update the main branch of all git repositories in the specified directory."
+    echo "If no directory is specified, uses the current directory."
+    echo ""
+    echo "Environment variables:"
+    echo "  GIT_SYNC_PARALLEL  Maximum parallel operations (default: 10)"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help    Show this help message"
+}
+
+# Handle help flag
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+# Verify target directory exists
+if [[ ! -d "$TARGET_DIR" ]]; then
+    echo -e "${RED}Error: Directory '$TARGET_DIR' does not exist${NC}"
+    exit 1
+fi
+
+# Convert to absolute path
+TARGET_DIR=$(cd "$TARGET_DIR" && pwd)
+
+# Function to update a single repo
+update_repo() {
+    local repo_path="$1"
+    local repo_name=$(basename "$repo_path")
+
+    cd "$repo_path" || return 1
+
+    # Get the default branch (main or master)
+    local default_branch
+    default_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "")
+
+    # Fallback: try main, then master
+    if [[ -z "$default_branch" ]]; then
+        if git show-ref --verify --quiet refs/heads/main 2>/dev/null; then
+            default_branch="main"
+        elif git show-ref --verify --quiet refs/heads/master 2>/dev/null; then
+            default_branch="master"
+        else
+            echo -e "${YELLOW}[$repo_name]${NC} Could not determine default branch, skipping"
+            return 1
+        fi
+    fi
+
+    # Get current branch
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+
+    # Fetch latest
+    if ! git fetch origin "$default_branch" --quiet 2>/dev/null; then
+        echo -e "${RED}[$repo_name]${NC} Failed to fetch from origin"
+        return 1
+    fi
+
+    # Check if we're on the default branch
+    if [[ "$current_branch" == "$default_branch" ]]; then
+        # Check for uncommitted changes
+        if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+            echo -e "${YELLOW}[$repo_name]${NC} Has uncommitted changes, skipping pull"
+            return 0
+        fi
+
+        # Pull latest
+        if git pull --ff-only origin "$default_branch" --quiet 2>/dev/null; then
+            echo -e "${GREEN}[$repo_name]${NC} Updated $default_branch"
+        else
+            echo -e "${YELLOW}[$repo_name]${NC} Could not fast-forward, may need manual merge"
+            return 0
+        fi
+    else
+        # Just update the tracking ref
+        if git fetch origin "$default_branch":"$default_branch" --quiet 2>/dev/null; then
+            echo -e "${GREEN}[$repo_name]${NC} Updated $default_branch (on branch: $current_branch)"
+        else
+            echo -e "${BLUE}[$repo_name]${NC} Fetched $default_branch (on branch: $current_branch, local changes exist)"
+        fi
+    fi
+
+    return 0
+}
+
+export -f update_repo
+export RED GREEN YELLOW BLUE NC
+
+echo -e "${BLUE}Scanning for git repositories in: $TARGET_DIR${NC}"
+echo ""
+
+# Find all git repositories (directories containing .git)
+repos=()
+while IFS= read -r -d '' gitdir; do
+    repos+=("$(dirname "$gitdir")")
+done < <(find "$TARGET_DIR" -maxdepth 2 -name ".git" -type d -print0 2>/dev/null)
+
+if [[ ${#repos[@]} -eq 0 ]]; then
+    echo -e "${YELLOW}No git repositories found in $TARGET_DIR${NC}"
+    exit 0
+fi
+
+echo -e "Found ${#repos[@]} repositories. Updating in parallel (max $MAX_PARALLEL)..."
+echo ""
+
+# Run updates in parallel (ignore xargs exit code since we handle errors per-repo)
+printf '%s\0' "${repos[@]}" | xargs -0 -P "$MAX_PARALLEL" -I {} bash -c 'update_repo "$@"' _ {} || true
+
+echo ""
+echo -e "${GREEN}Done!${NC}"
